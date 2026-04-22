@@ -1,0 +1,59 @@
+{
+  "test1_single_vs_batch": {
+    "single_calls": 5,
+    "single_tups": 0,
+    "single_duration": 43.694,
+    "batch_calls": 1,
+    "batch_tups": 0,
+    "batch_assessments": 1,
+    "batch_duration": 0.232,
+    "tups_match": true
+  },
+  "test2_independent_eval": {
+    "action": "GUARDRAIL_INTERVENED",
+    "assessments_count": 1,
+    "guardrail_intervened": true,
+    "expected_intervention": true,
+    "test_passed": true
+  },
+  "test3_large_batch": {
+    "blocks_sent": 20,
+    "calls_made": 1,
+    "tups": 0,
+    "assessments": 1,
+    "duration": 0.383
+  },
+  "test4_spike_simulation": {
+    "input_size_chars": 49995,
+    "input_size_tus": 50,
+    "approach_a": {
+      "calls": 1,
+      "tups": 0,
+      "throttled": false,
+      "duration": 0.37
+    },
+    "approach_b": {
+      "calls": 5,
+      "tups": 0,
+      "throttled": false,
+      "duration": 1.495
+    },
+    "approach_c": {
+      "calls": 5,
+      "tups": 0,
+      "throttled": false,
+      "duration": 1.663
+    }
+  },
+  "metadata": {
+    "guardrail_id": "bc8xwlpakqe2",
+    "region": "us-east-1",
+    "timestamp": "2026-04-22T17:08:21.444530+00:00",
+    "hypotheses": {
+      "H1_batch_is_1_rps": true,
+      "H2_tups_summed": true,
+      "H3_independent_eval": true,
+      "H4_rate_limited_no_spikes": true
+    }
+  }
+}
