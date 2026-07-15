@@ -21,6 +21,12 @@ import time
 from datetime import datetime, timezone, timedelta
 
 REGION = "us-east-1"
+RATE_WINDOW_RESET_SECONDS = 2
+
+
+def wait_for_rate_window_reset(seconds=RATE_WINDOW_RESET_SECONDS):
+    """Pause between test approaches so the API rate window resets and results are not contaminated."""
+    time.sleep(seconds)
 
 
 def test_single_vs_batch(client, guardrail_id):
@@ -255,7 +261,7 @@ def test_spike_simulation(client, guardrail_id):
         tups_a = 0
         print(f"    THROTTLED: {str(e)[:100]}")
 
-    time.sleep(2)  # Let the rate window reset
+    wait_for_rate_window_reset()
 
     # --- Approach B: Chunked + Batched (controlled RPS) ---
     print(f"\n[B] Chunked + Batched — {BATCH_SIZE} chunks per call...")
@@ -289,7 +295,7 @@ def test_spike_simulation(client, guardrail_id):
     print(f"    Throttled: {'YES' if throttled_b else 'NO'}")
     print(f"    Duration: {duration_b:.2f}s")
 
-    time.sleep(2)
+    wait_for_rate_window_reset()
 
     # --- Approach C: Chunked + Batched + Rate-limited ---
     print(f"\n[C] Chunked + Batched + Rate-limited (stay under {TUP_LIMIT} TUPs/sec)...")
@@ -314,8 +320,7 @@ def test_spike_simulation(client, guardrail_id):
         except Exception as e:
             throttled_c = True
 
-        # Rate limit: don't exceed TUPs/sec
-        time.sleep(delay_between_batches)
+        wait_for_rate_window_reset(delay_between_batches)
 
     duration_c = time.time() - start
 
@@ -371,21 +376,21 @@ def main():
         client, args.guardrail_id
     )
 
-    time.sleep(1)  # Brief pause between tests
+    wait_for_rate_window_reset(1)
 
     # Test 2: Independent evaluation
     results["test2_independent_eval"] = test_independent_evaluation(
         client, args.guardrail_id
     )
 
-    time.sleep(1)
+    wait_for_rate_window_reset(1)
 
     # Test 3: Large batch
     results["test3_large_batch"] = test_large_batch(
         client, args.guardrail_id
     )
 
-    time.sleep(1)
+    wait_for_rate_window_reset(1)
 
     # Test 4: Spike simulation
     results["test4_spike_simulation"] = test_spike_simulation(
