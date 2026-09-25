@@ -1,5 +1,64 @@
 # Optimize Amazon Bedrock Guardrails for high-throughput workloads
 
+This repository holds the code for the post below. [`guardrail_optimizer.py`](guardrail_optimizer.py) has helpers for three ways to use less of your Amazon Bedrock Guardrails quota: content block batching, result caching, and selective application. [`test_batch.py`](test_batch.py) checks the batching behavior against a live guardrail, so you can see the numbers for yourself.
+
+## Quick start
+
+You need Python 3.9 or later, an AWS account with Amazon Bedrock access, and credentials in your shell that allow `bedrock:CreateGuardrail`, `bedrock:DeleteGuardrail`, and `bedrock:ApplyGuardrail`.
+
+```bash
+git clone https://github.com/aws-samples/sample-bedrock-guardrails-throughput-optimization
+cd sample-bedrock-guardrails-throughput-optimization
+python3 -m pip install -r requirements.txt
+export AWS_PROFILE=your-profile   # replace with a profile that has Bedrock access
+
+python3 setup_guardrail.py                        # creates a test guardrail and prints its ID
+python3 test_batch.py --guardrail-id <id>         # runs four checks and writes a results JSON file
+python3 delete_guardrail.py --guardrail-id <id>   # deletes the test guardrail
+```
+
+On Windows, set the profile with `set AWS_PROFILE=your-profile` in Command Prompt or `$env:AWS_PROFILE="your-profile"` in PowerShell. Replace `<id>` with the ID that `setup_guardrail.py` prints.
+
+All three scripts default to us-east-1. To use another Region, pass the same `--region` value to all three.
+
+When the test run finishes, it prints a summary like this and saves the full results to `batch-test-results-<timestamp>.json`:
+
+```
+    H1: Batched call = 1 request for N blocks         ✅ CONFIRMED
+    H2: Batched text units ≤ single (per-call rounding) ✅ CONFIRMED
+    H3: Violation in a batch is detected (aggregated)  ✅ CONFIRMED
+    H4: Rate-limited batching ran without throttle     ✅ CONFIRMED
+
+    Total ApplyGuardrail invocations this run: 11
+```
+
+## What's in the repo
+
+| File | What it does |
+|------|--------------|
+| [`guardrail_optimizer.py`](guardrail_optimizer.py) | The reusable helpers: `apply_guardrail_batched`, the `GuardrailCache` class with `apply_with_cache`, `apply_selective`, and `total_text_units` for reading per-policy usage. |
+| [`test_batch.py`](test_batch.py) | Runs four checks against a live guardrail: call reduction, text unit accounting, detection inside a batch, and paced batching. |
+| [`setup_guardrail.py`](setup_guardrail.py) | Creates a test guardrail with the content filters the checks expect. |
+| [`delete_guardrail.py`](delete_guardrail.py) | Deletes the test guardrail. |
+| [`batch-test-results-20260812-182047.json`](batch-test-results-20260812-182047.json) | The run that the numbers in the post come from. |
+| [`requirements.txt`](requirements.txt) | Pinned `boto3` and `botocore` versions. |
+
+## Cost
+
+A test run makes 11 `ApplyGuardrail` calls and uses about 85 text units. Guardrails are billed per text unit, so a run costs a few cents at most. See [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) for current rates. The test guardrail costs nothing while idle, but it counts against your account's guardrail quota, so delete it when you're done.
+
+In production, the cost of Guardrails scales with the text you evaluate. Every text unit you remove with caching or selective application lowers your bill as well as your quota use. Batching mostly saves calls, not text units, so it does little for cost.
+
+## Known limitations
+
+- `GuardrailCache` keeps entries in process memory. A gateway with more than one instance needs a shared store such as Amazon ElastiCache.
+- The numbers in the post come from one run in us-east-1 against a guardrail that uses content filters only. Guardrails with more policy types use more text units per call.
+- Test 4 checks the pacing logic at low volume. It doesn't reproduce throttling at production scale.
+
+---
+
+# Optimize Amazon Bedrock Guardrails for high-throughput workloads
+
 by Guruprasad Seeryada | AWS Enterprise Support
 
 **Categories**: Amazon Bedrock, Amazon Bedrock Guardrails, Best Practices, Generative AI, Intermediate (200)
@@ -8,188 +67,199 @@ by Guruprasad Seeryada | AWS Enterprise Support
 
 ## Introduction
 
-Guardrail throughput becomes a bottleneck fast. Your centralized AI gateway serves thousands of users. Every request hits the [Amazon Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) API. Quotas push back.
+Say you run a central AI gateway for your company. Every prompt and every model response passes through it, and you've decided that all of it should go through [Amazon Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html). That works fine in a proof of concept. Then traffic grows to thousands of users, and the `ApplyGuardrail` API starts throttling your gateway.
 
-This post shows you three techniques to fix that: content block batching, intelligent caching, and selective application. Combined, they cut API calls by 80–90% while keeping full compliance coverage. We tested these patterns and confirmed a 190x speed improvement for batched calls.
+This post covers three techniques that reduce how much Guardrails quota each request uses: content block batching, result caching, and selective application. Each one attacks a different part of the problem, and they work well together. How much you save depends on how much of your traffic repeats, so rather than promise a percentage, the post gives you a test suite to measure your own numbers.
 
-You'll walk away with an architecture pattern, working code in a [companion GitHub repo](https://github.com/svguruprasad/guardrails-batch-test), and a monitoring strategy you can deploy today.
+By the end you'll have a request flow for your gateway, working Python code in [`guardrail_optimizer.py`](guardrail_optimizer.py), and a short list of Amazon CloudWatch metrics to watch.
 
-## Solution overview
+## Two quotas, not one
 
-Enterprise AI platforms route LLM traffic through a centralized gateway. When you apply guardrails to every request, two [service quotas](https://console.aws.amazon.com/servicequotas/home/services/bedrock/quotas) matter:
+Two [service quotas](https://console.aws.amazon.com/servicequotas/home/services/bedrock/quotas) govern `ApplyGuardrail`. The first is requests per second (RPS), which counts API calls. The second is text units per second (TUPs), which counts how much text you evaluate. One text unit is 1,000 characters. Both quotas are set per Region, and you can request an increase for either one in the Service Quotas console.
 
-**Requests per second (RPS)** — The number of `ApplyGuardrail` API calls per second. This quota is adjustable.
+Text units add up across policy types. A 1,000-character call against a guardrail with content filters, denied topics, and sensitive information filters uses three text units, one for each policy type. Categories inside the content filter don't add up the same way. Turning on all six content filter categories still counts as one text unit per 1,000 characters. The post [Best practices for applying Amazon Bedrock Guardrails to code generation workflows](https://aws.amazon.com/blogs/machine-learning/best-practices-for-applying-amazon-bedrock-guardrails-to-code-generation-workflows/) walks through this math in more detail.
 
-**Text units per second (TUPs)** — The volume of text processed per second. One text unit equals 1,000 characters. This quota has a hard limit per region.
+The two quotas are separate, and each one has its own throttling message. That makes it easy to fix one and make the other worse. If you split a large document into small pieces so that no single call carries too much text, you make more calls, and now RPS is the problem. The techniques in this post were picked so you can work on both at once.
 
-These are independent limits with different error messages. RPS throttles return a request-level throttle message. TUPs throttles return a text-units-per-second limit message. A common misconception: these are the same throttle. They aren't. Fixing one can worsen the other. Chunking large inputs into smaller pieces reduces text units per call — but increases the number of API calls. You need strategies that address both limits at once.
-
-Here's the optimized request flow:
+Here's the request flow we'll build:
 
 ```
-User Request → AI Gateway → [Cache Check] → [Selective Filter] → [Batch Content Blocks] → ApplyGuardrail API → Response
+User request → AI gateway → [cache check] → [selective filter] → [batch content blocks] → ApplyGuardrail → response
 ```
 
-Each step reduces what reaches the API. The cache check eliminates repeated content — system prompts you've already evaluated, RAG context you've seen before. The selective filter skips content that doesn't need evaluation, like tool outputs from trusted internal systems. Batching combines everything that's left into a single API call. Each technique stacks on the others, and the order matters: cache first (cheapest check), then filter, then batch what remains.
+Each stage removes work before the next one runs. The cache check drops content you've already evaluated, such as a system prompt that's identical on every request. The selective filter drops content you've decided doesn't need evaluation, such as output from your own internal tools. Batching packs whatever is left into one API call. Run them in that order, because the cache check is the cheapest.
 
 ## Content block batching
 
-Content block batching sends multiple text chunks in one API call instead of many separate calls. This directly reduces your RPS consumption.
+The [ApplyGuardrail API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html) accepts a list of content blocks in one request. If you're chunking a long document anyway, you can send all the chunks in one call instead of one call per chunk. That's all batching is, and it goes straight at your RPS quota.
 
-Consider a 10,000-character document that needs chunking. Without batching, that's 10 chunks at 1,000 characters each — 10 separate `ApplyGuardrail` calls. At 500 requests per second through your gateway, you'd need 5,000 RPS of quota. Most accounts start well below that. The [ApplyGuardrail API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html) accepts an array of content blocks in a single request. Ten chunks in one call consumes 1 RPS, not 10. Each block evaluates independently, so a violation in one block doesn't affect the others.
-
-In practice, this means you split your text into chunks aligned to text unit boundaries (1,000 characters each), wrap each chunk as a content block, and send the array in one call. The response contains per-block assessments, so you can trace exactly which chunk triggered a violation.
+Take a 10,000-character document split into ten 1,000-character chunks. Sent one at a time, that's ten calls. If your gateway handles 500 of these documents per second, you need 5,000 RPS. Sent as one batch, each document is one call, and the same traffic needs 500 RPS.
 
 ```python
-def apply_guardrail_batched(text, guardrail_id, guardrail_version):
-    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+def apply_guardrail_batched(client, text, guardrail_id, guardrail_version="DRAFT",
+                            chunk_chars=1000):
+    chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
     content_blocks = [{"text": {"text": chunk}} for chunk in chunks]
 
-    response = bedrock_runtime.apply_guardrail(
+    return client.apply_guardrail(
         guardrailIdentifier=guardrail_id,
         guardrailVersion=guardrail_version,
         source="INPUT",
-        content=content_blocks
+        content=content_blocks,
     )
-    return response
 ```
 
-See the full implementation with error handling in the [GitHub repo](https://github.com/svguruprasad/guardrails-batch-test).
+The full version in [`guardrail_optimizer.py`](guardrail_optimizer.py) adds error handling and refuses input that's too large for one request.
 
-The trade-off is that batching optimizes for RPS, not TUPs. You send the same total text volume — you just send it in fewer calls. If TUPs is your binding constraint, batching alone won't help. You need caching or selective application to reduce the actual text volume hitting the API. This technique works best when you chunk large inputs. The bigger the input, the bigger the RPS savings. A 50,000-character document drops from 50 API calls to 1. Expect RPS reductions of 60–80%, with TUPs unchanged since you're sending the same text volume in fewer calls.
+Before you rely on batching, know what comes back. The response to a batched call is aggregated. You get one top-level `action` and, in our tests, one assessment for the whole call rather than one per block. If any block violates a policy, the whole call comes back as `GUARDRAIL_INTERVENED`. That's the safe direction, because a bad block can't hide inside a batch. The catch is that the response won't tell you which block caused it. If your application needs to know, check the blocks from a flagged call again in smaller calls.
 
-## Intelligent caching
+Batching changes your text unit count less than you might expect. You still send the same characters, so most of your TUPs use stays the same. Rounding makes a small difference, which the results section covers. If TUPs is the quota that's hurting you, batching won't fix it, but caching and selective application will.
 
-Intelligent caching stores guardrail results for repeated content so you only evaluate what's actually new. This reduces both RPS and TUPs.
+Each request also has a size limit. A request over the limit is rejected with a `ValidationException` rather than throttled, so split very large inputs across several batched calls. Check the current limit for your Region in Service Quotas.
 
-The key insight here is that most text in an enterprise AI request isn't unique. System prompts repeat identically across every call. RAG context from knowledge bases recurs frequently — the same product documentation, the same policy excerpts. Only the user's input changes every time. Consider a gateway handling 500 requests per second. Each request includes a 2,000-character system prompt, 3,000 characters of RAG context, and 500 characters of user input. Without caching, you consume 5.5 TUPs per request — that's 2,750 TUPs per second across your fleet. With caching, only the 500-character user input hits the API — a 91% reduction in text volume.
+One security note. Cutting text every 1,000 characters can split a phrase across two blocks. A banned term or a prompt injection that straddles the boundary might not be detected, even though the same text inside one block would be. For untrusted input, use overlapping chunks or split on sentence or paragraph boundaries.
 
-You implement this by hashing each content block and storing the guardrail result with a time-to-live (TTL) based on content type. System prompts get a long TTL (24 hours) because they rarely change. RAG context gets a shorter TTL (1 hour) to match your knowledge base refresh cycle. User input never gets cached — it's unique and potentially adversarial.
+## Result caching
+
+Most of the text in a gateway request isn't new. The system prompt is the same on every call. RAG context comes from a knowledge base, so the same product documents and policy excerpts show up again and again. Usually only the user's message is new. If you cache guardrail results for the repeated parts, you evaluate them once instead of on every request, which cuts both RPS and TUPs.
+
+Here's how much text that can be. Say each request carries a 2,000-character system prompt, 3,000 characters of RAG context, and a 500-character user message. That's 5.5 text units per request, or 2,750 text units per second at 500 requests per second. If the system prompt and RAG context come from the cache, only the 500-character message goes to the API, about 9% of the original text. That figure is arithmetic for this example, not a measurement. Your real savings depend on how often your cache hits.
+
+The cache key combines a hash of the content with the guardrail version. The version matters. When you change your guardrail, for example by adding a denied topic, results from the old version stop matching and get evaluated again. Each content type gets its own time to live (TTL). System prompts rarely change, so they get 24 hours. RAG context gets one hour, to match a typical knowledge base refresh. User input is never cached, because it's different every time and it's the content you trust least.
 
 ```python
-SYSTEM_PROMPT_TTL = 86400   # 24 hours
-RAG_CONTEXT_TTL = 3600      # 1 hour
+def apply_with_cache(client, text, content_type, guardrail_id, version, cache):
+    def _call():
+        return client.apply_guardrail(
+            guardrailIdentifier=guardrail_id, guardrailVersion=version,
+            source="INPUT", content=[{"text": {"text": text}}],
+        )
 
-def apply_with_cache(text, content_type, guardrail_id, version):
     if content_type == "user_input":
-        return call_guardrail(text, guardrail_id, version)
-    cached = cache.get(text)
-    if cached:
+        return _call()
+
+    cached = cache.get(text, version)
+    if cached is not None:
         return cached
-    result = call_guardrail(text, guardrail_id, version)
+
+    result = _call()
     ttl = SYSTEM_PROMPT_TTL if content_type == "system_prompt" else RAG_CONTEXT_TTL
-    cache.put(text, result, ttl=ttl)
+    cache.put(text, version, result, ttl)
     return result
 ```
 
-See the full `GuardrailCache` class in the [GitHub repo](https://github.com/svguruprasad/guardrails-batch-test).
+The `GuardrailCache` class in [`guardrail_optimizer.py`](guardrail_optimizer.py) handles the key, the TTLs, and hit rate tracking. It keeps entries in memory. If your gateway runs on several instances, back the cache with a shared store such as Amazon ElastiCache so every instance sees the same entries.
 
-The trade-off is that caching requires an invalidation strategy. When you update your guardrail configuration — adding a new denied topic, changing a content filter threshold — cached results from the old version become stale. Include the guardrail version in your cache key so updates automatically invalidate old entries. You also need to size your cache appropriately. A gateway handling 500 unique RAG contexts per hour with a 1-hour TTL holds 500 entries. That's small. But if your RAG corpus is large and diverse, cache hit rates drop and the benefit shrinks. This technique works best when your workload has high content repetition. Enterprise gateways with standardized system prompts and curated knowledge bases see 60–70% cache hit rates. Expect RPS and TUPs reductions of 50–70% when repetition is high. If every request contains entirely unique content, caching won't help.
+Think about cache size too. If you see 500 distinct RAG passages an hour and use a one hour TTL, the cache holds about 500 entries, which is small. If your knowledge base is large and each request pulls different passages, the hit rate drops and so do the savings. If every request is unique, caching won't help.
 
 ## Selective application
 
-Selective application reduces the total text volume reaching the API by skipping content that doesn't need evaluation. Not all content carries the same risk.
+Some of the content in a request came from you. Your team wrote the system prompt, and your own internal services produced the tool output. Running guardrails on that text on every request spends quota on content you already trust.
 
-Your team authored the system prompt. Your internal tools generated the tool output. Evaluating trusted content wastes quota on text that will never trigger a violation. You classify content into risk tiers and apply guardrails accordingly. High-risk content (user input, model output shown to end users) always gets evaluated. Low-risk content (system prompts evaluated at deployment, tool outputs from trusted systems) gets skipped at request time.
-
-In practice, this means you tag each content block by type within a single request and only send the ones that need fresh evaluation. System prompts get evaluated once when you deploy them — cache that result and skip them at request time. Tool outputs from trusted internal systems skip evaluation entirely. User input always goes through.
+Selective application sorts content by risk. User input, and any model output shown to users, is always evaluated. The system prompt is evaluated once when you deploy it, and that result is cached. Output from trusted internal tools is skipped. RAG context is sent only when it isn't already in the cache.
 
 ```python
-def apply_selective(request, guardrail_id, version):
+def apply_selective(client, request, guardrail_id, version, cache=None):
     blocks = [{"text": {"text": request["user_input"]}}]
-
     for ctx in request.get("rag_contexts", []):
-        if cache.get(ctx) is None:
+        if cache is None or cache.get(ctx, version) is None:
             blocks.append({"text": {"text": ctx}})
 
-    # System prompts: evaluated once at deployment, cached
-    # Tool outputs: trusted internal systems, skipped
-    if not blocks:
-        return {"action": "NONE"}
-
-    return bedrock_runtime.apply_guardrail(
-        guardrailIdentifier=guardrail_id,
-        guardrailVersion=version,
-        source="INPUT",
-        content=blocks
+    # System prompts were evaluated at deploy time and trusted tool output is
+    # skipped, so neither is sent here.
+    return client.apply_guardrail(
+        guardrailIdentifier=guardrail_id, guardrailVersion=version,
+        source="INPUT", content=blocks,
     )
 ```
 
-The trade-off is that selective application reduces coverage by design. You're choosing not to evaluate certain content. That's safe when the content comes from trusted sources you control. It's risky if your "trusted" source can be influenced by user input — for example, a tool that echoes user text in its output. Audit your selective filters regularly and verify the risk classification still holds as your system evolves. This technique works best when your requests contain a mix of trusted and untrusted content. A request that's 80% system prompt and RAG context with 20% user input can skip most of its text volume. Expect RPS and TUPs reductions of 30–50%.
+This function doesn't write RAG passages back to the cache. It can't, because the batched response doesn't say which passage caused an intervention. Fill the cache for RAG passages some other way, for example by running each passage through `apply_with_cache` when you add it to your knowledge base.
 
-When you combine all three techniques, the reductions compound. Selective application reduces what enters the pipeline. Caching eliminates repeated content from what remains. Batching consolidates the rest into minimal API calls. Together, expect RPS reductions of 80–90% and TUPs reductions of 60–80%. Results vary based on the ratio of repeated versus unique content in your workload.
+If your application calls models through `InvokeModel` or `Converse` with a guardrail attached, Bedrock can do this filtering for you. You mark the parts of the prompt the guardrail should evaluate, and it skips the rest. See [Apply tags to user input to filter content](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-tagging.html).
+
+The trade-off is that you cover less on purpose. That's safe only if the content you trust is truly out of the user's reach. A tool that echoes user text back, or a document a user can upload into your knowledge base, turns trusted content into user content. Review what you skip each time you add a tool or a data source.
+
+## Putting them together
+
+The three techniques stack. Selective application decides what enters the pipeline, caching removes repeats from what's left, and batching sends the rest in as few calls as possible. Your overall savings depend on your mix of repeated and new content, so measure them with the test suite and CloudWatch before you plan capacity around them.
 
 ## Testing and results
 
-We tested these techniques with a structured experiment. The code and results are in the [companion GitHub repository](https://github.com/svguruprasad/guardrails-batch-test).
+We ran [`test_batch.py`](test_batch.py) once against a test guardrail in us-east-1 on August 12, 2026. The guardrail used content filters only. The raw output is in [`batch-test-results-20260812-182047.json`](batch-test-results-20260812-182047.json). It's a single run, so read the timings as a direction rather than a benchmark.
 
-We started with a simple question: does batching actually reduce RPS, or does the API count each content block separately? We sent 5 content blocks in a single `ApplyGuardrail` call and confirmed it consumed 1 RPS, not 5. That single finding validates the entire batching strategy.
+First, we checked that batching cuts calls. The test wraps the client and counts real calls instead of assuming them. Five single-block calls counted as five, and one batched call with the same five blocks counted as one. You can confirm this on the service side with the `Invocations` metric.
 
-Next, we verified that text units sum across blocks as expected. Five 1,000-character blocks in one call consumed 5 TUPs — same as five separate calls. This confirms batching is RPS-neutral on text volume. You save on call count, not on text processing.
+Next came text units. The `ApplyGuardrail` response has no single text unit field. It reports units per policy type, in fields such as `contentPolicyUnits` and `topicPolicyUnits`, so the test adds them up. We sent five 1,500-character blocks. As five separate calls they used 10 text units, two per call, because each call rounds up. As one batched call they used 8, which matches rounding once over 7,500 characters. So batching can save a little on text units as well as on calls.
 
-The independence test surprised us the least but mattered the most for production use. We embedded a policy violation in one block and clean text in the others. The API flagged only the violating block. This means you can batch aggressively without worrying that one bad chunk contaminates the entire request.
+One result surprised us. In the pacing test, we sent 30 chunks of exactly 1,000 characters in three batched calls of 10,000 characters each. We expected 30 text units and got 33, one extra per call. The large batch test showed the same pattern: 20 blocks totaling 30,000 characters used 31 units. Every call in the run used its character count divided by 1,000, rounded down, plus one. For most lengths that's the same as rounding up. When a call lands exactly on a multiple of 1,000 characters, it costs one extra unit. We haven't found this documented, so treat it as something we observed. When you plan capacity, allow for one extra unit per call.
 
-The performance difference was striking. Five individual `ApplyGuardrail` calls took 43.69 seconds. One batched call with the same 5 content blocks took 0.23 seconds. That's a 190x speed improvement. The gap comes from eliminating per-call overhead: connection setup, request serialization, and round-trip latency — multiplied across every call.
+Then we tested detection. We sent a harmless question and a prompt injection together in one call. The guardrail intervened and reported `PROMPT_ATTACK` as `BLOCKED`. It returned one assessment for both blocks, so the response didn't say which block was the problem, as described in the batching section.
 
-These aren't theoretical numbers. Run the test suite yourself from the [GitHub repo](https://github.com/svguruprasad/guardrails-batch-test) to validate against your own guardrail configuration.
+The last check was speed. The five sequential calls took 1.48 seconds, and the batched call took 0.28 seconds. Most of that gap is per-call overhead, meaning request setup plus a network round trip for every call. If you want a speedup figure for your own environment, warm up the client first and average several runs. The first calls in a process include SDK and TLS setup, which makes the sequential path look slower than it is.
+
+The pacing test also sent its three batched calls under a TUPs budget without being throttled. That shows the pacing logic works. It doesn't show what happens at production volume, because the test stays far below the quota on purpose.
 
 ## Monitoring
 
-After you deploy these techniques, track these [Amazon CloudWatch](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html) metrics for your guardrails in the `AWS/Bedrock` namespace via the [CloudWatch console](https://console.aws.amazon.com/cloudwatch/home):
+Guardrail metrics live in the `AWS/Bedrock/Guardrails` namespace in [Amazon CloudWatch](https://console.aws.amazon.com/cloudwatch/home). The [metrics reference](https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-guardrails-cw-metrics.html) lists all of them. Three matter most here.
 
-**InvocationThrottles (Sum)** — This should drop toward zero. If it doesn't, your batching or caching isn't catching enough traffic.
+`InvocationThrottles` counts throttled calls, and it should fall toward zero. If it doesn't, read the throttling message to see which quota you're hitting before you change anything.
 
-**TextUnitCount (Sum)** — Should decrease proportionally to your caching and selective application hit rates.
+`TextUnitCount` counts text units used. You can break it down by the `GuardrailPolicyType` dimension to see which policy type uses the most. It should fall as caching and selective application take effect.
 
-**Invocations (Sum)** — Should decrease proportionally to batching and caching combined.
+`Invocations` counts `ApplyGuardrail` calls, and it should fall as batching and caching take effect. Throttled calls don't show up in this metric, so read it together with `InvocationThrottles`.
 
-Add client-side metrics too. Track your cache hit rate — target above 60% for enterprise workloads. Track requests skipped by selective application to measure how much low-risk content you're filtering. Track average content blocks per batched call — higher means more RPS savings.
+Your own code should report a few numbers as well: the cache hit rate, how many blocks selective application skipped, and the average number of blocks per batched call. Together they tell you which technique is doing the work.
 
 ## Best practices
 
-**Start with caching.** It delivers the highest impact with the lowest complexity.
+Start with caching. It's the simplest to add, and it cuts both quotas.
 
-**Invalidate on guardrail changes.** Include the guardrail version number in your cache key. When you update your guardrail configuration, cached results from the old version become stale.
+Put the guardrail version in your cache key, so a change to your guardrail makes old results stop matching.
 
-**Never cache user input.** User-generated content is unique and potentially adversarial. Always evaluate it fresh.
+Never cache user input.
 
-**Test with production traffic patterns.** Optimization impact depends on your content mix. Use [guardrails detect mode](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-harmful-content-handling-options.html) to test without blocking real requests.
+Test with real traffic patterns. [Detect mode](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-harmful-content-handling-options.html) shows what your guardrail would do without blocking users, which lets you measure while you tune.
 
-**Audit your selective filters regularly.** Review which content types you exclude and verify the risk classification still holds.
+Review your selective filters each time you add a tool or a data source.
 
-**Consider multi-region distribution.** Quotas are per-region. Distributing traffic across regions gives you linear scaling of both RPS and TUPs limits. Check region availability on the [Amazon Bedrock endpoints page](https://docs.aws.amazon.com/general/latest/gr/bedrock.html).
+Request a quota increase when you need one. RPS and TUPs are both adjustable per Region in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home/services/bedrock/quotas). The techniques in this post lower how much quota you need, but you still have to size your quota for your peak traffic.
+
+If one Region isn't enough, spread traffic across Regions. Quotas are per Region, so each Region you add brings its own RPS and TUPs. Check your data residency requirements first, and check where Bedrock is available on the [Amazon Bedrock endpoints page](https://docs.aws.amazon.com/general/latest/gr/bedrock.html).
 
 ## Clean up
 
-If you created a test guardrail while following this post, delete it to avoid unintended usage:
+If you created the test guardrail, delete it:
+
+```bash
+python3 delete_guardrail.py --guardrail-id <id>
+```
+
+You can also delete it in the console:
 
 1. Open the [Amazon Bedrock Guardrails console](https://console.aws.amazon.com/bedrock/home#/guardrails).
 2. Select the guardrail you created for testing.
 3. Choose **Delete** and confirm.
 
-No other resources need cleanup. The Python code runs locally and doesn't create AWS resources.
+`setup_guardrail.py` is the only script that creates a resource. The test script only calls the runtime API.
 
 ## Conclusion
 
-You don't have to choose between safety guardrails and high throughput. Content block batching, intelligent caching, and selective application cut `ApplyGuardrail` API calls by 80–90%. Our tests confirmed a 190x speed improvement for batched calls.
+Running guardrails on every request doesn't have to mean constant throttling. Batching cuts the number of calls. Caching and selective application cut the amount of text you send. Which one to start with depends on the quota you're hitting: batching for RPS, caching for TUPs, and all three if you're short on both. For most gateways, a good order is caching first, then batching, then selective application. Selective application comes last because it takes the most work up front, since you have to classify your content by risk.
 
-These techniques work best in centralized AI gateway architectures. Repeated content like system prompts and RAG context often makes up 60–70% of text volume. Caching alone eliminates most of that. If RPS is your bottleneck, start with batching. If TUPs is your constraint, start with caching. If both are bottlenecks, layer all three. For most enterprise workloads, the right answer is all three techniques together. Start with caching (highest impact, lowest complexity), add batching (straightforward), then layer in selective application (requires risk classification work).
+To try it, follow the quick start at the top of this page, and then:
 
-Here's how to get started. You'll need an AWS account with [Amazon Bedrock](https://console.aws.amazon.com/bedrock/home) access and a guardrail configured with content filters. Code samples use Python and boto3.
-
-1. Clone the [companion repo](https://github.com/svguruprasad/guardrails-batch-test) and run the test suite against your guardrail to validate the batching behavior.
-2. Add caching for system prompts and RAG context. This single change delivers the largest immediate impact.
-3. Layer in content block batching for large inputs.
-4. Classify your use cases by risk tier and apply selective filtering.
-5. Set up CloudWatch monitoring to track your RPS and TUPs reductions.
-
-For quota adjustments, visit the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home/services/bedrock/quotas) for Amazon Bedrock.
+1. Add caching for system prompts and RAG context.
+2. Batch the chunks of large inputs.
+3. Classify content by risk, and skip what you trust.
+4. Watch the CloudWatch metrics above as you roll out each step.
 
 ## Resources
 
 - [Amazon Bedrock Guardrails documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html)
 - [ApplyGuardrail API reference](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html)
-- [Companion GitHub repository — guardrails-batch-test](https://github.com/svguruprasad/guardrails-batch-test)
+- [Monitor Amazon Bedrock Guardrails using CloudWatch metrics](https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-guardrails-cw-metrics.html)
+- [Companion repository: sample-bedrock-guardrails-throughput-optimization](https://github.com/aws-samples/sample-bedrock-guardrails-throughput-optimization)
 - [Build safe generative AI applications like a Pro: Best Practices with Amazon Bedrock Guardrails](https://aws.amazon.com/blogs/machine-learning/build-safe-generative-ai-applications-like-a-pro-best-practices-with-amazon-bedrock-guardrails/)
 - [Use the ApplyGuardrail API with long-context inputs and streaming outputs](https://aws.amazon.com/blogs/machine-learning/use-the-applyguardrail-api-with-long-context-inputs-and-streaming-outputs-in-amazon-bedrock/)
 - [Amazon Bedrock Guardrails cross-account safeguards](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html)

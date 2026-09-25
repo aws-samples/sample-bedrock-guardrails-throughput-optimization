@@ -1,0 +1,5 @@
+# Pinned to the boto3/botocore verified against the ApplyGuardrail response
+# schema used here (GuardrailUsage per-policy unit fields: contentPolicyUnits,
+# topicPolicyUnits, etc. - there is no single `textUnits` field).
+boto3==1.43.59
+botocore==1.43.59
