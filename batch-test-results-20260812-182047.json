@@ -1,0 +1,55 @@
+{
+  "test1_single_vs_batch": {
+    "single_calls": 5,
+    "single_tus": 10,
+    "single_duration": 1.48,
+    "batch_calls": 1,
+    "batch_tus": 8,
+    "batch_assessments": 1,
+    "batch_duration": 0.276,
+    "h1_calls_reduced": true,
+    "h2_tus_batched_not_higher": true
+  },
+  "test2_batched_detection": {
+    "action": "GUARDRAIL_INTERVENED",
+    "assessments_count": 1,
+    "triggered_policies": [
+      "PROMPT_ATTACK:BLOCKED"
+    ],
+    "intervened": true,
+    "aggregated_not_per_block": true,
+    "h3_batched_detection": true
+  },
+  "test3_large_batch": {
+    "blocks_sent": 20,
+    "calls_made": 1,
+    "tus": 31,
+    "assessments": 1,
+    "duration": 0.429,
+    "test3_passed": true
+  },
+  "test4_rate_limited": {
+    "chunks": 30,
+    "batches": 3,
+    "batch_size": 10,
+    "inter_batch_delay_ms": 50.0,
+    "total_tus": 33,
+    "throttled": false,
+    "duration": 0.894,
+    "h4_rate_limited_clean": true,
+    "scope_note": "Validates the pacing mechanism, not true production-spike throttling."
+  },
+  "metadata": {
+    "guardrail_id": "bc8xwlpakqe2",
+    "region": "us-east-1",
+    "version": "DRAFT",
+    "timestamp": "2026-08-12T18:20:47.004821+00:00",
+    "total_invocations": 11,
+    "hypotheses": {
+      "H1": true,
+      "H2": true,
+      "H3": true,
+      "H4": true
+    }
+  }
+}

@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 blog-draft.md
+batch-test-results-*.json
+!batch-test-results-20260812-182047.json
